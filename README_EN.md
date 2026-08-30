@@ -2,11 +2,16 @@
 
 TrafficCop now does two things only: it counts bidirectional VPS traffic (RX + TX), and writes/sends one Telegram report at the top of every hour.
 
-Example:
+Telegram reports use a four-line HTML monospace card:
 
 ```text
-[HongKong VPS] 2026-08-29 9.00-10.00消耗1.25G流量，今天到现在一共消耗了3.40G流量，总消耗18.72G流量
+┌ HongKong VPS · 2026-08-30 09:00–10:00
+│ This interval: 1.25 GiB
+│ Today total: 3.40 GiB
+└ Since install: 18.72 GiB
 ```
+
+At midnight, the third line identifies the completed date and shows its full-day total.
 
 Notifications, hourly intervals, and daily resets always use Beijing time (Asia/Shanghai). The installation-time vnStat counters are the baseline, so pre-install traffic is excluded.
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # TrafficCop v3: hourly bidirectional traffic accounting + Telegram.
 set -u
-VERSION="3.0.1"
+VERSION="3.1.0"
 REPORT_TIMEZONE="Asia/Shanghai"
 WORK_DIR="${TRAFFICCOP_WORK_DIR:-/root/TrafficCop}"
 SCRIPT_PATH="$WORK_DIR/trafficcop.sh"; CONFIG_FILE="$WORK_DIR/config.json"; STATE_FILE="$WORK_DIR/state"
@@ -84,16 +84,18 @@ remove_cron(){ crontab -l 2>/dev/null|awk -v m="$MARKER" '$0==m{s=1;next}s{s=0;n
 gib(){ awk -v b="$1" 'BEGIN{printf "%.2f",b/1073741824}'; }
 interval(){
   local sd ed; sd=$(TZ="$3" date -d "@$1" +%F); ed=$(TZ="$3" date -d "@$2" +%F)
-  if [ "$sd" = "$ed" ]; then printf '%s %s-%s' "$sd" "$(TZ="$3" date -d "@$1" +%-H.%M)" "$(TZ="$3" date -d "@$2" +%-H.%M)"
-  else printf '%s-%s' "$(TZ="$3" date -d "@$1" '+%F %H.%M')" "$(TZ="$3" date -d "@$2" '+%F %H.%M')"; fi
+  if [ "$sd" = "$ed" ]; then printf '%s %s–%s' "$sd" "$(TZ="$3" date -d "@$1" +%H:%M)" "$(TZ="$3" date -d "@$2" +%H:%M)"
+  else printf '%s–%s' "$(TZ="$3" date -d "@$1" '+%F %H:%M')" "$(TZ="$3" date -d "@$2" '+%F %H:%M')"; fi
 }
+html_escape(){ printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
 send_tg(){
-  local r; r=$(curl -fsS --max-time 20 --data-urlencode "chat_id=$2" --data-urlencode "text=$3" "https://api.telegram.org/bot$1/sendMessage" 2>&1) || { log "Telegram 失败：$r"; return 1; }
+  local r text; text="<pre>$(html_escape "$3")</pre>"
+  r=$(curl -fsS --max-time 20 --data-urlencode "chat_id=$2" --data-urlencode "parse_mode=HTML" --data-urlencode "text=$text" "https://api.telegram.org/bot$1/sendMessage" 2>&1) || { log "Telegram 失败：$r"; return 1; }
   printf %s "$r"|jq -e '.ok==true' >/dev/null 2>&1 || { log "Telegram API 失败：$r"; return 1; }
 }
 
 run_report(){
-  local iface zone token chat name pair rx tx now rd td used total today sd ed span msg
+  local iface zone token chat name display_name pair rx tx now rd td used total today report_day day_label sd ed span msg
   config_ok || die "尚未配置，请先打开交互面板。"
   iface=$(jget .interface); zone="$REPORT_TIMEZONE"; token=$(jget .bot_token); chat=$(jget .chat_id); name=$(jget '.machine_name//""')
   exec 9>"$LOCK_FILE"; flock -n 9 || { log "已有任务运行，本次跳过。"; return; }
@@ -102,11 +104,16 @@ run_report(){
   if [ "$rx" -ge "$LAST_RX" ]; then rd=$((rx-LAST_RX)); else rd=$rx; fi
   if [ "$tx" -ge "$LAST_TX" ]; then td=$((tx-LAST_TX)); else td=$tx; fi
   used=$((rd+td)); total=$((TOTAL_BYTES+used)); sd=$(TZ="$zone" date -d "@$LAST_TIMESTAMP" +%F); ed=$(TZ="$zone" date -d "@$now" +%F)
-  if [ "$STATE_DATE" = "$ed" ] && [ "$sd" = "$ed" ]; then today=$((TODAY_BYTES+used))
-  elif [ "$(TZ="$zone" date -d "@$now" +%H%M)" = 0000 ]; then today=0; else today=$used; fi
-  span=$(interval "$LAST_TIMESTAMP" "$now" "$zone")
-  msg="${name:+[$name] }${span}消耗$(gib "$used")G流量，今天到现在一共消耗了$(gib "$today")G流量，总消耗$(gib "$total")G流量"
-  printf '%s\t%s\t%s\t%s\t%s\n' "$(TZ="$zone" date -d "@$now" '+%F %T')" "$span" "$used" "$today" "$total" >>"$HISTORY_FILE"
+  if [ "$sd" != "$ed" ]; then
+    report_day=$((TODAY_BYTES+used)); today=0; day_label="${sd} 全日累计"
+  elif [ "$STATE_DATE" = "$ed" ]; then
+    today=$((TODAY_BYTES+used)); report_day=$today; day_label="今日累计"
+  else
+    today=$used; report_day=$today; day_label="今日累计"
+  fi
+  span=$(interval "$LAST_TIMESTAMP" "$now" "$zone"); display_name="${name:-VPS}"
+  printf -v msg '┌ %s · %s\n│ 本时段：%s GiB\n│ %s：%s GiB\n└ 安装后总计：%s GiB' "$display_name" "$span" "$(gib "$used")" "$day_label" "$(gib "$report_day")" "$(gib "$total")"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$(TZ="$zone" date -d "@$now" '+%F %T')" "$span" "$used" "$report_day" "$total" >>"$HISTORY_FILE"
   write_state "$rx" "$tx" "$total" "$today" "$ed" "$now"; log "$msg"; printf '%s\n' "$msg"
   send_tg "$token" "$chat" "$msg" && log "Telegram 推送成功。" || { printf 'Telegram 推送失败，详见 %s\n' "$LOG_FILE" >&2; return 1; }
 }
@@ -116,11 +123,11 @@ test_tg(){
 }
 status(){
   config_ok || { echo '尚未配置。'; return; }; local total=0 today=0; load_state && { total=$TOTAL_BYTES; today=$TODAY_BYTES; }
-  printf '机器：%s\n网卡：%s（接收 + 发送）\n推送时区：北京时间（Asia/Shanghai）\n今日累计：%s G\n安装后累计：%s G\n' "$(jget '.machine_name//""')" "$(jget .interface)" "$(gib "$today")" "$(gib "$total")"
+  printf '机器：%s\n网卡：%s（接收 + 发送）\n推送时区：北京时间（Asia/Shanghai）\n今日累计：%s GiB\n安装后累计：%s GiB\n' "$(jget '.machine_name//""')" "$(jget .interface)" "$(gib "$today")" "$(gib "$total")"
 }
 history(){
   [ -s "$HISTORY_FILE" ] || { echo '暂无小时记录。'; return; }
-  tail -n 25 "$HISTORY_FILE"|awk -F '\t' 'NR==1{print;next}{printf "%s\t%s\t%.2f G\t%.2f G\t%.2f G\n",$1,$2,$3/1073741824,$4/1073741824,$5/1073741824}'
+  tail -n 25 "$HISTORY_FILE"|awk -F '\t' 'NR==1{print;next}{printf "%s\t%s\t%.2f GiB\t%.2f GiB\t%.2f GiB\n",$1,$2,$3/1073741824,$4/1073741824,$5/1073741824}'
 }
 install_all(){
   root; mkdir -p "$WORK_DIR"; install_deps || die "依赖安装失败。"
