@@ -80,8 +80,8 @@ bash trafficcop.sh --install
 | 文件 | 用途 |
 |------|------|
 | `config.json` | 配置文件 |
-| `state.json` | 统计状态（累计值、今日值、上次读取基准） |
-| `hourly_traffic.tsv` | 每小时流量历史（时间、GiB、RX、TX） |
+| `state` | 统计状态（累计值、今日值、上次读取基准） |
+| `hourly_traffic.tsv` | 每小时流量历史（结束时间、时段、本时段字节、今日累计、安装后累计） |
 | `trafficcop.log` | 推送与错误日志 |
 | `bin/resvg` | resvg 渲染器（仅 x86_64 且下载成功时存在） |
 | `fonts/` | 本地字体（仅系统无字体且 CDN 下载成功时存在） |
@@ -93,7 +93,7 @@ bash trafficcop.sh --install
 ```bash
 bash trafficcop.sh --install        # 安装/重新配置（含依赖与推送时间设置）
 bash trafficcop.sh --run            # 手动统计一次（按当前推送规则决定是否推送）
-bash trafficcop.sh --test-telegram  # 发送测试图片
+bash trafficcop.sh --test-telegram  # 发送测试图片（基于实时流量数据，不落盘）
 bash trafficcop.sh --status         # 查看状态
 bash trafficcop.sh --history        # 查看最近 25 条统计
 ```

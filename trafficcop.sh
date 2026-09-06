@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # TrafficCop v4: hourly bidirectional traffic accounting + Telegram photo pushes.
 set -u
-VERSION="4.0.0"
+VERSION="4.0.1"
 REPORT_TIMEZONE="Asia/Shanghai"
 WORK_DIR="${TRAFFICCOP_WORK_DIR:-/root/TrafficCop}"
 SCRIPT_PATH="$WORK_DIR/trafficcop.sh"; CONFIG_FILE="$WORK_DIR/config.json"; STATE_FILE="$WORK_DIR/state"
@@ -330,14 +330,23 @@ run_report(){
 }
 test_tg(){
   config_ok || die "请先配置。"
-  local token chat name span
+  local token chat name span iface pair rx=0 tx=0 rd=0 td=0 used=0 today=0 total=0
   token=$(jget .bot_token); chat=$(jget .chat_id); name=$(jget '.machine_name//""')
   find_renderer || install_render_dep
-  span="$(TZ="$REPORT_TIMEZONE" date '+%F %H:%M') 测试"
+  # 展示真实数据：基于当前 state 基线与 vnStat 实时读数（不落盘，不影响整点统计）
+  iface=$(jget .interface)
+  if pair=$(vn_total "$iface"); then read -r rx tx <<<"$pair"; fi
+  if load_state; then
+    if [ "$rx" -ge "$LAST_RX" ]; then rd=$((rx-LAST_RX)); else rd=$rx; fi
+    if [ "$tx" -ge "$LAST_TX" ]; then td=$((tx-LAST_TX)); else td=$tx; fi
+    used=$((rd+td)); total=$((TOTAL_BYTES+used)); today=$((TODAY_BYTES+used))
+  fi
+  span="自上次统计以来 · $(TZ="$REPORT_TIMEZONE" date '+%F %H:%M')"
   CARD_MODE="normal"; CARD_NAME="${name:-VPS}"; CARD_HEADER_R="$span"
-  CARD_ROW1_L="CURRENT"; CARD_ROW1_V="1.25 GiB"; CARD_SUB="↓ RX 0.62 GiB · ↑ TX 0.63 GiB"
-  CARD_ROW2_L="TODAY"; CARD_ROW2_V="3.40 GiB"; CARD_ROW3_L="TOTAL"; CARD_ROW3_V="18.72 GiB"
-  send_card "${name:+[$name] }TrafficCop 图片推送测试。" || die "测试失败，请查看日志。"
+  CARD_ROW1_L="CURRENT"; CARD_ROW1_V="$(gib "$used") GiB"
+  CARD_SUB="↓ RX $(gib "$rd") GiB · ↑ TX $(gib "$td") GiB"
+  CARD_ROW2_L="TODAY"; CARD_ROW2_V="$(gib "$today") GiB"; CARD_ROW3_L="TOTAL"; CARD_ROW3_V="$(gib "$total") GiB"
+  send_card "${name:+[$name] }TrafficCop 图片推送测试（实时数据）。" || die "测试失败，请查看日志。"
   printf '%b测试图片发送成功。%b\n' "$GREEN" "$NC"
 }
 format_push_hours(){
