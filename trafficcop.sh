@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # TrafficCop v4: hourly bidirectional traffic accounting + Telegram photo pushes.
 set -u
-VERSION="4.0.1"
+VERSION="4.0.2"
 REPORT_TIMEZONE="Asia/Shanghai"
 WORK_DIR="${TRAFFICCOP_WORK_DIR:-/root/TrafficCop}"
 SCRIPT_PATH="$WORK_DIR/trafficcop.sh"; CONFIG_FILE="$WORK_DIR/config.json"; STATE_FILE="$WORK_DIR/state"
@@ -207,7 +207,7 @@ build_card_svg(){
   <text x=\"354\" y=\"82\" text-anchor=\"middle\" font-size=\"18\" font-weight=\"bold\" fill=\"#ffffff\" letter-spacing=\"2\">DAILY SUMMARY</text>"
   else tag=""; fi
   cat >"$1" <<EOF
-<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="550" viewBox="0 0 1000 550" font-family="DejaVu Sans, Noto Sans, Noto Sans CJK SC, WenQuanYi Micro Hei, Liberation Sans, Arial, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="550" viewBox="0 0 1000 550" font-family="DejaVu Sans, Liberation Sans, Arial, sans-serif">
  <defs>
   <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
    <stop offset="0" stop-color="#eef6f2"/><stop offset="0.38" stop-color="#d4e9e4"/>
@@ -318,9 +318,9 @@ run_report(){
     CARD_ROW3_L="TOTAL"; CARD_ROW3_V="$(gib "$total") GiB"
     send_card "$msg" && log "每日总结推送成功。" || { printf 'Telegram 推送失败，详见 %s\n' "$LOG_FILE" >&2; return 1; }
   elif [ "$do_push" -eq 1 ]; then
-    CARD_MODE="normal"; CARD_NAME="$display_name"; CARD_HEADER_R="$span"
+    CARD_MODE="normal"; CARD_NAME="$display_name"; CARD_HEADER_R="${span//–/-}"
     CARD_ROW1_L="CURRENT"; CARD_ROW1_V="$(gib "$used") GiB"
-    CARD_SUB="↓ RX $(gib "$rd") GiB · ↑ TX $(gib "$td") GiB"
+    CARD_SUB="RX $(gib "$rd") GiB / TX $(gib "$td") GiB"
     if [ "$sd" != "$ed" ]; then CARD_ROW2_L="PREV DAY"; else CARD_ROW2_L="TODAY"; fi
     CARD_ROW2_V="$(gib "$report_day") GiB"; CARD_ROW3_L="TOTAL"; CARD_ROW3_V="$(gib "$total") GiB"
     send_card "$msg" && log "Telegram 推送成功。" || { printf 'Telegram 推送失败，详见 %s\n' "$LOG_FILE" >&2; return 1; }
@@ -330,21 +330,22 @@ run_report(){
 }
 test_tg(){
   config_ok || die "请先配置。"
-  local token chat name span iface pair rx=0 tx=0 rd=0 td=0 used=0 today=0 total=0
+  local token chat name span iface pair rx=0 tx=0 rd=0 td=0 used=0 today=0 total=0 now
   token=$(jget .bot_token); chat=$(jget .chat_id); name=$(jget '.machine_name//""')
   find_renderer || install_render_dep
   # 展示真实数据：基于当前 state 基线与 vnStat 实时读数（不落盘，不影响整点统计）
-  iface=$(jget .interface)
+  iface=$(jget .interface); now=$(date +%s)
   if pair=$(vn_total "$iface"); then read -r rx tx <<<"$pair"; fi
   if load_state; then
     if [ "$rx" -ge "$LAST_RX" ]; then rd=$((rx-LAST_RX)); else rd=$rx; fi
     if [ "$tx" -ge "$LAST_TX" ]; then td=$((tx-LAST_TX)); else td=$tx; fi
     used=$((rd+td)); total=$((TOTAL_BYTES+used)); today=$((TODAY_BYTES+used))
+    span="$(interval "$LAST_TIMESTAMP" "$now" "$REPORT_TIMEZONE")"
   fi
-  span="自上次统计以来 · $(TZ="$REPORT_TIMEZONE" date '+%F %H:%M')"
-  CARD_MODE="normal"; CARD_NAME="${name:-VPS}"; CARD_HEADER_R="$span"
+  [ -n "$span" ] || span="no baseline yet - $(TZ="$REPORT_TIMEZONE" date -d "@$now" '+%F %H:%M')"
+  CARD_MODE="normal"; CARD_NAME="${name:-VPS}"; CARD_HEADER_R="${span//–/-}"
   CARD_ROW1_L="CURRENT"; CARD_ROW1_V="$(gib "$used") GiB"
-  CARD_SUB="↓ RX $(gib "$rd") GiB · ↑ TX $(gib "$td") GiB"
+  CARD_SUB="RX $(gib "$rd") GiB / TX $(gib "$td") GiB"
   CARD_ROW2_L="TODAY"; CARD_ROW2_V="$(gib "$today") GiB"; CARD_ROW3_L="TOTAL"; CARD_ROW3_V="$(gib "$total") GiB"
   send_card "${name:+[$name] }TrafficCop 图片推送测试（实时数据）。" || die "测试失败，请查看日志。"
   printf '%b测试图片发送成功。%b\n' "$GREEN" "$NC"
