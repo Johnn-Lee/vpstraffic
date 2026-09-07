@@ -1,9 +1,13 @@
 {
-  "bot_token": "123456789:AAEhLOlKv4rTGjLKj3f-boG9bXHqQ8p1Q2M",
-  "chat_id": "123456789",
+  "bot_token": "YOUR_BOT_TOKEN",
+  "chat_id": "YOUR_CHAT_ID",
   "interface": "eth0",
   "timezone": "Asia/Shanghai",
   "machine_name": "Your VPS",
   "daily_summary": true,
-  "push_hours": [1, 9, 22]
+  "push_hours": [
+    8,
+    12,
+    20
+  ]
 }

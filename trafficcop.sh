@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 # TrafficCop v4: hourly bidirectional traffic accounting + Telegram photo pushes.
-set -u
-VERSION="4.0.2"
+set -uo pipefail
+VERSION="4.1.0"
 REPORT_TIMEZONE="Asia/Shanghai"
 WORK_DIR="${TRAFFICCOP_WORK_DIR:-/root/TrafficCop}"
 SCRIPT_PATH="$WORK_DIR/trafficcop.sh"; CONFIG_FILE="$WORK_DIR/config.json"; STATE_FILE="$WORK_DIR/state"
-HISTORY_FILE="$WORK_DIR/hourly_traffic.tsv"; LOG_FILE="$WORK_DIR/trafficcop.log"; LOCK_FILE="$WORK_DIR/trafficcop.lock"
+HISTORY_FILE="$WORK_DIR/hourly_traffic.tsv"; LOCK_FILE="$WORK_DIR/trafficcop.lock"
+HISTORY_HEADER=$'ended_at\tinterval\thour_bytes\ttoday_bytes\ttotal_bytes\trx_bytes\ttx_bytes'
 BIN_DIR="$WORK_DIR/bin"; RESVG_BIN_FILE="$BIN_DIR/resvg"; LOCAL_FONT="$WORK_DIR/fonts/DejaVuSans.ttf"
 SVG_FILE="$WORK_DIR/.card.svg"; PNG_FILE="$WORK_DIR/.card.png"
 RESVG_URL="https://github.com/linebender/resvg/releases/download/v0.48.1/resvg-linux-x86_64.tar.gz"
 DEJAVU_URL="https://cdn.jsdelivr.net/npm/dejavu-fonts-ttf@2.37.3/ttf"
 MARKER="# TrafficCop hourly traffic report"
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
-log(){ mkdir -p "$WORK_DIR"; printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG_FILE"; }
+log(){ printf '%s %s\n' "$(date '+%F %T')" "$*" >&2; }
 die(){ printf '%b错误：%s%b\n' "$RED" "$*" "$NC" >&2; log "ERROR: $*"; exit 1; }
 root(){ [ "$(id -u)" -eq 0 ] || die "请使用 root 用户运行。"; }
 pause(){ printf '\n按回车键继续...'; read -r _; }
@@ -40,7 +41,7 @@ vn_total(){
 ensure_iface(){
   local i; vn_total "$1" >/dev/null 2>&1 && return
   vnstat --add -i "$1" >/dev/null 2>&1 || true; start_vnstat
-  for i in 1 2 3 4 5; do vn_total "$1" >/dev/null 2>&1 && return; sleep 1; done
+  for ((i=0; i<5; i++)); do vn_total "$1" >/dev/null 2>&1 && return; sleep 1; done
   die "vnStat 无法读取网卡 $1。"
 }
 
@@ -114,23 +115,56 @@ configure_push(){
 }
 
 write_state(){
-  local tmp="$STATE_FILE.tmp.$$"; printf 'LAST_RX=%s\nLAST_TX=%s\nTOTAL_BYTES=%s\nTODAY_BYTES=%s\nSTATE_DATE=%s\nLAST_TIMESTAMP=%s\n' "$1" "$2" "$3" "$4" "$5" "$6" >"$tmp"
-  chmod 600 "$tmp"; mv -f "$tmp" "$STATE_FILE"
+  local tmp="$STATE_FILE.tmp.$$"; printf 'LAST_RX=%s\nLAST_TX=%s\nTOTAL_BYTES=%s\nTODAY_BYTES=%s\nSTATE_DATE=%s\nLAST_TIMESTAMP=%s\n' "$1" "$2" "$3" "$4" "$5" "$6" >"$tmp" || die "状态写入失败。"
+  chmod 600 "$tmp" && mv -f "$tmp" "$STATE_FILE" || die "状态保存失败。"
 }
 load_state(){
   LAST_RX=0; LAST_TX=0; TOTAL_BYTES=0; TODAY_BYTES=0; STATE_DATE=""; LAST_TIMESTAMP=0
-  [ -s "$STATE_FILE" ] || return 1; . "$STATE_FILE"
-  [[ "$LAST_RX" =~ ^[0-9]+$ && "$LAST_TX" =~ ^[0-9]+$ && "$TOTAL_BYTES" =~ ^[0-9]+$ && "$TODAY_BYTES" =~ ^[0-9]+$ && "$LAST_TIMESTAMP" =~ ^[0-9]+$ ]] || die "状态文件损坏。"
+  [ -s "$STATE_FILE" ] || return 1
+  # 旧版 KEY=value 状态按数据读取，不执行文件中的 shell 内容。
+  local key value seen="|"
+  while IFS='=' read -r key value; do
+    [[ "$seen" != *"|$key|"* ]] || die "状态字段重复。"
+    case "$key" in
+      LAST_RX|LAST_TX|TOTAL_BYTES|TODAY_BYTES|LAST_TIMESTAMP)
+        [[ "$value" =~ ^[0-9]+$ ]] || die "状态文件损坏。"; printf -v "$key" '%s' "$value";;
+      STATE_DATE) [[ "$value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || die "状态日期损坏。"; STATE_DATE="$value";;
+      *) die "状态文件包含未知字段。";;
+    esac
+    seen+="$key|"
+  done <"$STATE_FILE"
+  for key in LAST_RX LAST_TX TOTAL_BYTES TODAY_BYTES STATE_DATE LAST_TIMESTAMP; do
+    [[ "$seen" == *"|$key|"* ]] || die "状态文件不完整。"
+  done
+}
+ensure_history(){
+  # 原五列数值不变；旧记录未知的 RX/TX 留空，新记录补充两列以支持区间汇总。
+  local header tmp="$HISTORY_FILE.tmp.$$"
+  if [ ! -s "$HISTORY_FILE" ]; then
+    printf '%s\n' "$HISTORY_HEADER" >"$HISTORY_FILE" || die "无法创建小时记录。"
+  else
+    IFS= read -r header <"$HISTORY_FILE"
+    if [ "$header" = $'ended_at\tinterval\thour_bytes\ttoday_bytes\ttotal_bytes' ]; then
+      { printf '%s\n' "$HISTORY_HEADER"; tail -n +2 "$HISTORY_FILE" | awk '{printf "%s\t\t\n",$0}'; } >"$tmp" || die "历史数据迁移失败。"
+      chmod 600 "$tmp" && mv -f "$tmp" "$HISTORY_FILE" || die "历史数据保存失败。"
+    elif [ "$header" != "$HISTORY_HEADER" ]; then
+      die "无法识别 hourly_traffic.tsv 表头，已停止以保护历史数据。"
+    fi
+  fi
+  chmod 600 "$HISTORY_FILE"
 }
 init_state(){
+  if [ -s "$HISTORY_FILE" ] && [ "$(wc -l <"$HISTORY_FILE")" -gt 1 ]; then
+    die "存在历史记录但缺少 state；请同时恢复 state，避免累计值归零。"
+  fi
   local pair rx tx now day; pair=$(vn_total "$1") || die "无法建立流量基线。"; read -r rx tx <<<"$pair"
   now=$(date +%s); day=$(TZ="$2" date +%F); write_state "$rx" "$tx" 0 0 "$day" "$now"
-  [ -s "$HISTORY_FILE" ] || printf 'ended_at\tinterval\thour_bytes\ttoday_bytes\ttotal_bytes\n' >"$HISTORY_FILE"
+  ensure_history
   log "建立安装基线 interface=$1 rx=$rx tx=$tx"
 }
 install_cron(){
   local old; old=$(crontab -l 2>/dev/null || true)
-  { printf '%s\n' "$old"|awk -v m="$MARKER" '$0==m{s=1;next}s{s=0;next}{print}'|sed '/^[[:space:]]*$/d'; printf '%s\n0 * * * * %s --run >> %s 2>&1\n' "$MARKER" "$SCRIPT_PATH" "$WORK_DIR/cron.log"; }|crontab -
+  { printf '%s\n' "$old"|awk -v m="$MARKER" '$0==m{s=1;next}s{s=0;next}{print}'|sed '/^[[:space:]]*$/d'; printf '%s\n0 * * * * "%s" --run >/dev/null 2>&1\n' "$MARKER" "$SCRIPT_PATH"; }|crontab - || die "定时任务安装失败。"
 }
 remove_cron(){ crontab -l 2>/dev/null|awk -v m="$MARKER" '$0==m{s=1;next}s{s=0;next}{print}'|crontab - || true; }
 gib(){ awk -v b="$1" 'BEGIN{printf "%.2f",b/1073741824}'; }
@@ -138,6 +172,35 @@ interval(){
   local sd ed; sd=$(TZ="$3" date -d "@$1" +%F); ed=$(TZ="$3" date -d "@$2" +%F)
   if [ "$sd" = "$ed" ]; then printf '%s %s–%s' "$sd" "$(TZ="$3" date -d "@$1" +%H:%M)" "$(TZ="$3" date -d "@$2" +%H:%M)"
   else printf '%s–%s' "$(TZ="$3" date -d "@$1" '+%F %H:%M')" "$(TZ="$3" date -d "@$2" '+%F %H:%M')"; fi
+}
+
+push_window(){
+  # 当日首段从零点开始，其余从上一个配置时点开始，与上次发送成功与否无关。
+  local now="$1" day hour previous start end result first first_epoch
+  day=$(TZ="$REPORT_TIMEZONE" date -d "@$now" +%F)
+  hour=$((10#$(TZ="$REPORT_TIMEZONE" date -d "@$now" +%H)))
+  previous=$(printf '%s' "$2" | jq -r --argjson h "$hour" '[.[]|select(.<$h)]|max//0')
+  printf -v start '%s %02d:00' "$day" "$previous"
+  end=$(TZ="$REPORT_TIMEZONE" date -d "@$now" '+%F %H:%M')
+  # 按分钟比较：08:00:01 的整点记录属于结束于 08:00 的上一段。
+  result=$(awk -F '\t' -v start="$start" -v end="$end" '
+    NR>1 && substr($1,1,16)>start && substr($1,1,16)<=end {
+      if (!count++) first=substr($2,1,16)
+      used+=$3
+      if ($6 ~ /^[0-9]+$/ && $7 ~ /^[0-9]+$/) {rx+=$6; tx+=$7} else unknown=1
+    }
+    END {printf "%.0f %.0f %.0f %d %s\n",used,rx,tx,unknown,first}
+  ' "$HISTORY_FILE") || die "无法读取推送区间历史。"
+  read -r PUSH_USED PUSH_RX PUSH_TX PUSH_UNKNOWN first <<<"$result"
+  # 首次部分小时或任务中断时，显示实际记录起点；兼容旧记录的 19.00 格式。
+  if [ -n "$first" ]; then
+    first="${first//./:}"
+    first_epoch=$(TZ="$REPORT_TIMEZONE" date -d "$first" +%s) || die "无法识别历史区间起点。"
+    start="$first_epoch"
+  else
+    start=$(TZ="$REPORT_TIMEZONE" date -d "$start" +%s)
+  fi
+  PUSH_SPAN=$(interval "$start" "$now" "$REPORT_TIMEZONE")
 }
 
 # ---------- 图片渲染（Monet 风格 SVG → PNG → Telegram sendPhoto） ----------
@@ -259,21 +322,21 @@ EOF
 render_png(){
   # $1 SVG 文件，$2 PNG 输出
   if [ -n "$RESVG_BIN" ]; then
-    if [ -s "$LOCAL_FONT" ]; then "$RESVG_BIN" --quiet --use-font-file "$LOCAL_FONT" "$1" "$2" 2>>"$LOG_FILE"
-    else "$RESVG_BIN" --quiet "$1" "$2" 2>>"$LOG_FILE"; fi
-  elif [ -n "$RSVG_BIN" ]; then "$RSVG_BIN" -w 1000 -o "$2" "$1" 2>>"$LOG_FILE"
+    if [ -s "$LOCAL_FONT" ]; then "$RESVG_BIN" --quiet --use-font-file "$LOCAL_FONT" "$1" "$2" >&2
+    else "$RESVG_BIN" --quiet "$1" "$2" >&2; fi
+  elif [ -n "$RSVG_BIN" ]; then "$RSVG_BIN" -w 1000 -o "$2" "$1" >&2
   else return 1; fi
 }
 send_photo(){
-  local r; r=$(curl -fsS --max-time 30 -F "chat_id=$2" -F "caption=$3" -F "photo=@$4;type=image/png" "https://api.telegram.org/bot$1/sendPhoto" 2>&1) || { log "Telegram sendPhoto 失败：$r"; return 1; }
+  local r; r=$(curl -fsS --max-time 30 -F "chat_id=$2" -F "photo=@$3;type=image/png" "https://api.telegram.org/bot$1/sendPhoto" 2>&1) || { log "Telegram sendPhoto 失败：$r"; return 1; }
   printf %s "$r"|jq -e '.ok==true' >/dev/null 2>&1 || { log "Telegram API 失败：$r"; return 1; }
 }
 send_card(){
-  # 依赖调用方局部变量 $token $chat；$1 为图片说明文字。统计已落盘，失败只记日志不回滚。
+  # 只发送图片，不附加 caption 或额外文本。依赖调用方局部变量 $token $chat。
   local rc=1
   find_renderer || { log "未找到 SVG 渲染器，图片推送跳过（统计已保存）。"; return 1; }
   if build_card_svg "$SVG_FILE" && render_png "$SVG_FILE" "$PNG_FILE"; then
-    send_photo "$token" "$chat" "$1" "$PNG_FILE" && rc=0
+    send_photo "$token" "$chat" "$PNG_FILE" && rc=0
   else
     log "图片生成失败，本次推送跳过（统计已保存）。"
   fi
@@ -281,12 +344,12 @@ send_card(){
   return "$rc"
 }
 
-run_report(){
+run_report()(
   local iface zone token chat name display_name pair rx tx now rd td used total today report_day day_label sd ed span msg bh daily_on ph_json do_daily do_push
   config_ok || die "尚未配置，请先打开交互面板。"
   iface=$(jget .interface); zone="$REPORT_TIMEZONE"; token=$(jget .bot_token); chat=$(jget .chat_id); name=$(jget '.machine_name//""')
   exec 9>"$LOCK_FILE"; flock -n 9 || { log "已有任务运行，本次跳过。"; return; }
-  load_state || init_state "$iface" "$zone"; load_state
+  load_state || init_state "$iface" "$zone"; load_state; ensure_history
   pair=$(vn_total "$iface") || die "无法读取 $iface 的 vnStat 数据。"; read -r rx tx <<<"$pair"; now=$(date +%s)
   if [ "$rx" -ge "$LAST_RX" ]; then rd=$((rx-LAST_RX)); else rd=$rx; fi
   if [ "$tx" -ge "$LAST_TX" ]; then td=$((tx-LAST_TX)); else td=$tx; fi
@@ -300,8 +363,8 @@ run_report(){
   fi
   span=$(interval "$LAST_TIMESTAMP" "$now" "$zone"); display_name="${name:-VPS}"
   printf -v msg '┌ %s · %s\n│ 本时段：%s GiB\n│ %s：%s GiB\n└ 安装后总计：%s GiB' "$display_name" "$span" "$(gib "$used")" "$day_label" "$(gib "$report_day")" "$(gib "$total")"
-  printf '%s\t%s\t%s\t%s\t%s\n' "$(TZ="$zone" date -d "@$now" '+%F %T')" "$span" "$used" "$report_day" "$total" >>"$HISTORY_FILE"
-  write_state "$rx" "$tx" "$total" "$today" "$ed" "$now"; log "$msg"; printf '%s\n' "$msg"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(TZ="$zone" date -d "@$now" '+%F %T')" "$span" "$used" "$report_day" "$total" "$rd" "$td" >>"$HISTORY_FILE" || die "小时记录写入失败，未更新状态。"
+  write_state "$rx" "$tx" "$total" "$today" "$ed" "$now"
   # ---- 推送决策：统计每整点照常，仅按北京时间与配置决定是否发送 ----
   bh=$((10#$(TZ="$zone" date -d "@$now" +%H)))
   daily_on=$(get_daily_setting); ph_json=$(get_push_hours_json)
@@ -311,26 +374,33 @@ run_report(){
   else
     printf '%s' "$ph_json"|jq -e --argjson h "$bh" 'index($h)!=null' >/dev/null 2>&1 && do_push=1
   fi
+  if [ "$do_push" -eq 1 ]; then
+    push_window "$now" "$ph_json"
+    span="$PUSH_SPAN"
+    printf -v msg '┌ %s · %s\n│ 本时段：%s GiB\n│ %s：%s GiB\n└ 安装后总计：%s GiB' "$display_name" "$span" "$(gib "$PUSH_USED")" "$day_label" "$(gib "$report_day")" "$(gib "$total")"
+  fi
+  printf '%s\n' "$msg"
   if [ "$do_daily" -eq 1 ]; then
     CARD_MODE="daily"; CARD_NAME="$display_name"; CARD_HEADER_R="$sd"
     CARD_ROW1_L="DAILY TRAFFIC"; CARD_ROW1_V="$(gib "$report_day") GiB"; CARD_SUB=""
     CARD_ROW2_L="AVG / HOUR"; CARD_ROW2_V="$(awk -v b="$report_day" 'BEGIN{printf "%.2f",b/24/1073741824}') GiB"
     CARD_ROW3_L="TOTAL"; CARD_ROW3_V="$(gib "$total") GiB"
-    send_card "$msg" && log "每日总结推送成功。" || { printf 'Telegram 推送失败，详见 %s\n' "$LOG_FILE" >&2; return 1; }
+    send_card && log "每日总结推送成功。" || { printf 'Telegram 推送失败，流量已保存；可手动运行 --test-telegram 查看错误。\n' >&2; return 1; }
   elif [ "$do_push" -eq 1 ]; then
     CARD_MODE="normal"; CARD_NAME="$display_name"; CARD_HEADER_R="${span//–/-}"
-    CARD_ROW1_L="CURRENT"; CARD_ROW1_V="$(gib "$used") GiB"
-    CARD_SUB="RX $(gib "$rd") GiB / TX $(gib "$td") GiB"
+    CARD_ROW1_L="CURRENT"; CARD_ROW1_V="$(gib "$PUSH_USED") GiB"
+    if [ "$PUSH_UNKNOWN" -eq 0 ]; then CARD_SUB="RX $(gib "$PUSH_RX") GiB / TX $(gib "$PUSH_TX") GiB"
+    else CARD_SUB=""; fi
     if [ "$sd" != "$ed" ]; then CARD_ROW2_L="PREV DAY"; else CARD_ROW2_L="TODAY"; fi
     CARD_ROW2_V="$(gib "$report_day") GiB"; CARD_ROW3_L="TOTAL"; CARD_ROW3_V="$(gib "$total") GiB"
-    send_card "$msg" && log "Telegram 推送成功。" || { printf 'Telegram 推送失败，详见 %s\n' "$LOG_FILE" >&2; return 1; }
+    send_card && log "Telegram 推送成功。" || { printf 'Telegram 推送失败，流量已保存；可手动运行 --test-telegram 查看错误。\n' >&2; return 1; }
   else
     log "整点 $bh 未命中推送时间，仅统计。"
   fi
-}
+)
 test_tg(){
   config_ok || die "请先配置。"
-  local token chat name span iface pair rx=0 tx=0 rd=0 td=0 used=0 today=0 total=0 now
+  local token chat name span="" iface pair rx=0 tx=0 rd=0 td=0 used=0 today=0 total=0 now
   token=$(jget .bot_token); chat=$(jget .chat_id); name=$(jget '.machine_name//""')
   find_renderer || install_render_dep
   # 展示真实数据：基于当前 state 基线与 vnStat 实时读数（不落盘，不影响整点统计）
@@ -347,7 +417,7 @@ test_tg(){
   CARD_ROW1_L="CURRENT"; CARD_ROW1_V="$(gib "$used") GiB"
   CARD_SUB="RX $(gib "$rd") GiB / TX $(gib "$td") GiB"
   CARD_ROW2_L="TODAY"; CARD_ROW2_V="$(gib "$today") GiB"; CARD_ROW3_L="TOTAL"; CARD_ROW3_V="$(gib "$total") GiB"
-  send_card "${name:+[$name] }TrafficCop 图片推送测试（实时数据）。" || die "测试失败，请查看日志。"
+  send_card || die "测试失败，请查看上方错误。"
   printf '%b测试图片发送成功。%b\n' "$GREEN" "$NC"
 }
 format_push_hours(){
@@ -364,17 +434,22 @@ status(){
 }
 history(){
   [ -s "$HISTORY_FILE" ] || { echo '暂无小时记录。'; return; }
-  tail -n 25 "$HISTORY_FILE"|awk -F '\t' 'NR==1{print;next}{printf "%s\t%s\t%.2f GiB\t%.2f GiB\t%.2f GiB\n",$1,$2,$3/1073741824,$4/1073741824,$5/1073741824}'
+  printf '结束时间\t统计区间\t区间流量\t当日累计\t安装后累计\n'
+  tail -n +2 "$HISTORY_FILE" | tail -n 25 | awk -F '\t' '{printf "%s\t%s\t%.2f GiB\t%.2f GiB\t%.2f GiB\n",$1,$2,$3/1073741824,$4/1073741824,$5/1073741824}'
 }
-install_all(){
+install_all()(
   root; mkdir -p "$WORK_DIR"; install_deps || die "依赖安装失败。"
-  if [ "$(readlink -f "${BASH_SOURCE[0]}")" != "$(readlink -f "$SCRIPT_PATH" 2>/dev/null || true)" ]; then cp -f "${BASH_SOURCE[0]}" "$SCRIPT_PATH"; fi
+  if [ "$(readlink -f "${BASH_SOURCE[0]}")" != "$(readlink -f "$SCRIPT_PATH" 2>/dev/null || true)" ]; then cp -f "${BASH_SOURCE[0]}" "$SCRIPT_PATH" || die "脚本安装失败。"; fi
   chmod 700 "$SCRIPT_PATH"; start_vnstat; config_ok || configure
   config_ok && push_fields_missing && configure_push
-  local iface zone; iface=$(jget .interface); zone="$REPORT_TIMEZONE"; ensure_iface "$iface"; [ -s "$STATE_FILE" ] || init_state "$iface" "$zone"; install_cron
+  exec 9>"$LOCK_FILE"; flock 9 || die "无法获取安装锁。"
+  local iface zone; iface=$(jget .interface); zone="$REPORT_TIMEZONE"; ensure_iface "$iface"; load_state || init_state "$iface" "$zone"; ensure_history
+  chmod 600 "$CONFIG_FILE" "$STATE_FILE" || die "无法设置数据文件权限。"
+  install_cron
+  rm -f -- "$WORK_DIR/trafficcop.log" "$WORK_DIR/cron.log"
   install_render_dep || true
   printf '%b安装完成：每整点统计一次流量，并按配置的北京时间推送 Telegram 图片。%b\n' "$GREEN" "$NC"
-}
+)
 menu(){
   root; mkdir -p "$WORK_DIR"
   while true; do clear 2>/dev/null || true; printf '%bTrafficCop v%s%b\n双向流量统计 + 按配置时间推送 Telegram 图片卡片。\n\n' "$CYAN" "$VERSION" "$NC"
@@ -383,4 +458,6 @@ menu(){
     case "$c" in 1) install_all;pause;; 2) install_deps;configure;install_all;pause;; 3) test_tg;pause;; 4) status;pause;; 5) history;pause;; 6) run_report;pause;; 7) remove_cron;echo '任务已停用，配置和数据仍保留。';pause;; 0) exit;; *) echo '无效选择。';sleep 1;; esac
   done
 }
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 case "${1:-}" in --run)run_report;; --install)install_all;; --test-telegram)test_tg;; --status)status;; --history)history;; --help)printf '用法：%s [--install|--run|--test-telegram|--status|--history]\n' "$0";; "")menu;; *)die "未知参数：$1";; esac
+fi
