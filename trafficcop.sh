@@ -259,12 +259,11 @@ install_render_dep(){
 xml_escape(){ printf '%s' "$1"|sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g"; }
 build_card_svg(){
   # 内容通过 CARD_* 全局变量传入；$1 为输出文件
-  local name header_r row1l row1v row2l row2v row3l row3v sub tag
+  local name header_r row1l row1v row2l row2v row3l row3v tag
   name=$(xml_escape "${CARD_NAME:-VPS}"); header_r=$(xml_escape "${CARD_HEADER_R:-}")
   row1l=$(xml_escape "${CARD_ROW1_L:-CURRENT}"); row1v=$(xml_escape "${CARD_ROW1_V:-}")
   row2l=$(xml_escape "${CARD_ROW2_L:-TODAY}"); row2v=$(xml_escape "${CARD_ROW2_V:-}")
   row3l=$(xml_escape "${CARD_ROW3_L:-TOTAL}"); row3v=$(xml_escape "${CARD_ROW3_V:-}")
-  sub=$(xml_escape "${CARD_SUB:-}")
   if [ "${CARD_MODE:-normal}" = "daily" ]; then tag="
   <rect x=\"256\" y=\"56\" width=\"196\" height=\"38\" rx=\"19\" fill=\"#a996cf\" opacity=\"0.88\"/>
   <text x=\"354\" y=\"82\" text-anchor=\"middle\" font-size=\"18\" font-weight=\"bold\" fill=\"#ffffff\" letter-spacing=\"2\">DAILY SUMMARY</text>"
@@ -308,8 +307,7 @@ build_card_svg(){
  <text x="936" y="86" text-anchor="end" font-size="22" fill="#54798a">$header_r</text>
  <text x="64" y="134" font-size="38" font-weight="bold" fill="#1d3d49">$name</text>
  <text x="96" y="252" font-size="21" letter-spacing="3" fill="#497382">$row1l</text>
- <text x="904" y="258" text-anchor="end" font-size="54" font-weight="bold" fill="#123f4c">$row1v</text>
- <text x="904" y="292" text-anchor="end" font-size="20" fill="#5b8290">$sub</text>
+ <text x="904" y="274" text-anchor="end" font-size="54" font-weight="bold" fill="#123f4c">$row1v</text>
  <line x1="96" y1="316" x2="904" y2="316" stroke="#8fb6c0" stroke-width="1" opacity="0.4"/>
  <text x="96" y="368" font-size="21" letter-spacing="3" fill="#497382">$row2l</text>
  <text x="904" y="374" text-anchor="end" font-size="54" font-weight="bold" fill="#123f4c">$row2v</text>
@@ -382,15 +380,13 @@ run_report()(
   printf '%s\n' "$msg"
   if [ "$do_daily" -eq 1 ]; then
     CARD_MODE="daily"; CARD_NAME="$display_name"; CARD_HEADER_R="$sd"
-    CARD_ROW1_L="DAILY TRAFFIC"; CARD_ROW1_V="$(gib "$report_day") GiB"; CARD_SUB=""
+    CARD_ROW1_L="DAILY TRAFFIC"; CARD_ROW1_V="$(gib "$report_day") GiB"
     CARD_ROW2_L="AVG / HOUR"; CARD_ROW2_V="$(awk -v b="$report_day" 'BEGIN{printf "%.2f",b/24/1073741824}') GiB"
     CARD_ROW3_L="TOTAL"; CARD_ROW3_V="$(gib "$total") GiB"
     send_card && log "每日总结推送成功。" || { printf 'Telegram 推送失败，流量已保存；可手动运行 --test-telegram 查看错误。\n' >&2; return 1; }
   elif [ "$do_push" -eq 1 ]; then
     CARD_MODE="normal"; CARD_NAME="$display_name"; CARD_HEADER_R="${span//–/-}"
     CARD_ROW1_L="CURRENT"; CARD_ROW1_V="$(gib "$PUSH_USED") GiB"
-    if [ "$PUSH_UNKNOWN" -eq 0 ]; then CARD_SUB="RX $(gib "$PUSH_RX") GiB / TX $(gib "$PUSH_TX") GiB"
-    else CARD_SUB=""; fi
     if [ "$sd" != "$ed" ]; then CARD_ROW2_L="PREV DAY"; else CARD_ROW2_L="TODAY"; fi
     CARD_ROW2_V="$(gib "$report_day") GiB"; CARD_ROW3_L="TOTAL"; CARD_ROW3_V="$(gib "$total") GiB"
     send_card && log "Telegram 推送成功。" || { printf 'Telegram 推送失败，流量已保存；可手动运行 --test-telegram 查看错误。\n' >&2; return 1; }
@@ -415,7 +411,6 @@ test_tg(){
   [ -n "$span" ] || span="no baseline yet - $(TZ="$REPORT_TIMEZONE" date -d "@$now" '+%F %H:%M')"
   CARD_MODE="normal"; CARD_NAME="${name:-VPS}"; CARD_HEADER_R="${span//–/-}"
   CARD_ROW1_L="CURRENT"; CARD_ROW1_V="$(gib "$used") GiB"
-  CARD_SUB="RX $(gib "$rd") GiB / TX $(gib "$td") GiB"
   CARD_ROW2_L="TODAY"; CARD_ROW2_V="$(gib "$today") GiB"; CARD_ROW3_L="TOTAL"; CARD_ROW3_V="$(gib "$total") GiB"
   send_card || die "测试失败，请查看上方错误。"
   printf '%b测试图片发送成功。%b\n' "$GREEN" "$NC"
